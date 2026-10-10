@@ -1,0 +1,236 @@
+// Retail POS database schema.
+// Monetary values are stored as integers in the currency's base unit (IDR has
+// no minor unit in practice), which avoids floating point rounding problems.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  CASHIER
+}
+
+enum MovementType {
+  INITIAL // opening stock when a product is created
+  SALE // deducted by checkout
+  RESTOCK // stock added (purchase / delivery)
+  REMOVE // stock removed (damage, loss, expiry...)
+  ADJUSTMENT // manual correction to an absolute value
+  OPNAME // physical stock count
+  VOID_RETURN // stock returned when a transaction is voided
+  IMPORT // stock set by CSV import
+}
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  QRIS
+  DEBIT_CARD
+  CREDIT_CARD
+}
+
+enum TransactionStatus {
+  COMPLETED
+  VOIDED
+}
+
+enum DiscountType {
+  AMOUNT
+  PERCENT
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  name         String
+  username     String   @unique
+  email        String?  @unique
+  passwordHash String
+  role         Role     @default(CASHIER)
+  isActive     Boolean  @default(true)
+  // Incremented on password reset / deactivation to invalidate issued sessions
+  tokenVersion Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  transactions       Transaction[]       @relation("Cashier")
+  voidedTransactions Transaction[]       @relation("VoidedBy")
+  movements          InventoryMovement[]
+  activityLogs       ActivityLog[]
+}
+
+model Category {
+  id          Int      @id @default(autoincrement())
+  name        String   @unique
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  products Product[]
+}
+
+model Product {
+  id            Int      @id @default(autoincrement())
+  sku           String   @unique
+  barcode       String?  @unique
+  name          String
+  description   String?
+  categoryId    Int?
+  purchasePrice Int
+  sellingPrice  Int
+  // A CHECK constraint (see migration) guarantees stock can never go negative.
+  stock         Int      @default(0)
+  minStock      Int      @default(0)
+  unit          String   @default("pcs")
+  imageUrl      String?
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  category         Category?           @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  movements        InventoryMovement[]
+  transactionItems TransactionItem[]
+
+  @@index([name])
+  @@index([categoryId])
+  @@index([isActive, name])
+  @@index([stock])
+}
+
+model InventoryMovement {
+  id             Int          @id @default(autoincrement())
+  productId      Int
+  type           MovementType
+  quantityChange Int
+  previousStock  Int
+  newStock       Int
+  reason         String?
+  userId         Int?
+  transactionId  Int?
+  createdAt      DateTime     @default(now())
+
+  product     Product      @relation(fields: [productId], references: [id], onDelete: Restrict)
+  user        User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+
+  @@index([productId, createdAt])
+  @@index([createdAt])
+  @@index([type])
+}
+
+model Transaction {
+  id             Int               @id @default(autoincrement())
+  number         String            @unique
+  // Client-generated idempotency key: a retried checkout returns the original sale
+  clientRef      String?           @unique
+  cashierId      Int
+  status         TransactionStatus @default(COMPLETED)
+  subtotal       Int
+  discountType   DiscountType?
+  discountValue  Float             @default(0)
+  discountAmount Int               @default(0)
+  taxRate        Float             @default(0)
+  taxAmount      Int               @default(0)
+  total          Int
+  totalCost      Int
+  amountPaid     Int
+  change         Int               @default(0)
+  itemCount      Int
+  note           String?
+  createdAt      DateTime          @default(now())
+  voidedAt       DateTime?
+  voidedById     Int?
+  voidReason     String?
+
+  cashier   User                @relation("Cashier", fields: [cashierId], references: [id], onDelete: Restrict)
+  voidedBy  User?               @relation("VoidedBy", fields: [voidedById], references: [id], onDelete: SetNull)
+  items     TransactionItem[]
+  payments  Payment[]
+  movements InventoryMovement[]
+
+  @@index([createdAt])
+  @@index([status, createdAt])
+  @@index([cashierId, createdAt])
+}
+
+model TransactionItem {
+  id            Int    @id @default(autoincrement())
+  transactionId Int
+  productId     Int
+  // Snapshot of product data at the time of sale (keeps history accurate)
+  productName   String
+  sku           String
+  unit          String
+  unitPrice     Int
+  purchasePrice Int
+  quantity      Int
+  subtotal      Int
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  product     Product     @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([transactionId])
+  @@index([productId])
+}
+
+model Payment {
+  id            Int           @id @default(autoincrement())
+  transactionId Int
+  method        PaymentMethod
+  amount        Int
+  reference     String?
+  createdAt     DateTime      @default(now())
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  @@index([transactionId])
+  @@index([method])
+}
+
+model StoreSetting {
+  id                     Int      @id @default(1)
+  storeName              String   @default("My Store")
+  logoUrl                String?
+  address                String   @default("")
+  phone                  String   @default("")
+  email                  String   @default("")
+  receiptHeader          String   @default("")
+  receiptFooter          String   @default("Thank you for shopping!")
+  receiptPaperSize       String   @default("58")
+  receiptShowLogo        Boolean  @default(false)
+  currency               String   @default("IDR")
+  taxEnabled             Boolean  @default(false)
+  taxRate                Float    @default(11)
+  defaultDiscountPercent Float    @default(0)
+  timezone               String   @default("Asia/Jakarta")
+  updatedAt              DateTime @updatedAt
+}
+
+model ActivityLog {
+  id          Int      @id @default(autoincrement())
+  userId      Int?
+  action      String
+  entity      String
+  entityId    String?
+  description String
+  createdAt   DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@index([entity, createdAt])
+}
+
+// Per-day counter used to generate gap-free INV-YYYYMMDD-XXXX numbers.
+// Incremented with an atomic upsert inside the checkout transaction.
+model DailySequence {
+  date String @id // YYYYMMDD in the store timezone
+  last Int    @default(0)
+}
